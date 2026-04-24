@@ -1,0 +1,327 @@
+# LOS Prediction Datasets
+
+Four processed datasets for Length of Stay prediction and SHAP interpretability analysis.
+
+| Dataset | File | Rows | Columns | Source | Population |
+|---|---|---|---|---|---|
+| MIMIC-4 | `mimic4_los.csv` | 545,847 | 59 | Local CSV files | General inpatient |
+| MIMIC-3 | `mimic3_los.csv` | 58,878 | 50 | Google BigQuery | ICU patients |
+| eICU | `eicu_los.csv` | 199,628 | 47 | Google BigQuery | ICU patients (multi-site) |
+| Synthea | `synthea_los.csv` | 6,480 | 47 | Neo4j (local) | Synthetic inpatient |
+
+---
+
+## How to Build
+
+### MIMIC-4
+```bash
+python build_mimic4_los_dataset.py
+```
+Reads directly from `raw/mimic4/*.csv`. `labevents.csv` (~17 GB) is processed in chunks automatically.
+
+### MIMIC-3
+```bash
+source ~/my_python_env/venv/bin/activate
+python build_mimic3_los_bigquery.py
+```
+Queries `physionet-data.mimiciii_clinical` via Google BigQuery (project `eicu-494316`). No local file download needed.
+
+Requirements:
+- PhysioNet credentialed access to MIMIC-III
+- BigQuery access granted via PhysioNet MIMIC-III page
+- `gcloud auth application-default login` completed
+
+### eICU
+```bash
+source ~/my_python_env/venv/bin/activate
+python build_eicu_los_bigquery.py
+```
+Queries `physionet-data.eicu_crd` via Google BigQuery (project `eicu-494316`).
+
+Requirements:
+- PhysioNet credentialed access to eICU-CRD
+- BigQuery access granted via PhysioNet eICU page
+- `gcloud auth application-default login` completed
+
+### Synthea (Neo4j)
+```bash
+source ~/my_python_env/venv/bin/activate
+python build_synthea_los_neo4j.py
+```
+Queries the local Neo4j database `synthea-sample` at `neo4j://127.0.0.1:7687`.
+
+Requirements:
+- Neo4j running locally with `synthea-sample` database loaded
+- `neo4j` Python package installed (`pip install neo4j`)
+
+---
+
+## How to Load
+
+All datasets use the same load function in `dataset.py`:
+
+```python
+from dataset import load_mimic4_los
+
+(X_train, y_train,
+ X_val,   y_val,
+ X_test,  y_test,
+ feature_cols,     # same order as X columns — pass directly to SHAP
+ continuous_cols,  # RobustScaled
+ binary_cols,      # not scaled
+ scaler) = load_mimic4_los(csv_path="processed/mimic4_los.csv")
+
+# MIMIC-3:  csv_path="processed/mimic3_los.csv"
+# Synthea:  csv_path="processed/synthea_los.csv", target="los_days"
+```
+
+Split: time-based 70 / 10 / 20 sorted by `admittime`.
+
+---
+
+## Dataset Comparison
+
+| Property | MIMIC-4 | MIMIC-3 | eICU | Synthea |
+|---|---|---|---|---|
+| LOS mean | 4.76 days | 10.15 days | 2.68 days | 4.92 days |
+| LOS median | 2.82 days | 6.49 days | 1.59 days | 4.04 days |
+| LOS unit | Hospital stay | Hospital stay | ICU stay | Hospital stay |
+| ICU rate | 15.6% | 98% | 100% | — |
+| ED triage vitals | Yes | No | No | No |
+| Diagnosis coding | ICD-9 + ICD-10 | ICD-9 only | None (APACHE) | SNOMED CT |
+| Comorbidity method | Elixhauser (ICD prefix) | Elixhauser (ICD prefix) | APACHE `apachepredvar` fields | Elixhauser (SNOMED text) |
+| Severity score | — | — | APACHE score + pred mortality | — |
+| Physiology at admission | Triage vitals (ED only) | — | 21 APACHE APS variables | — |
+| Data type | Real patients | Real ICU patients | Real ICU patients (multi-site) | Synthetic patients |
+
+---
+
+## Comorbidity Logic
+
+The `cm_*` columns represent the same 31 Elixhauser comorbidity categories across all datasets, but are derived differently depending on what each database provides.
+
+### MIMIC-4 — ICD prefix matching (ICD-9 + ICD-10)
+
+Each admission has diagnosis codes in `diagnoses_icd`. We match these against the Elixhauser code lists using **prefix matching**:
+
+```
+ICD code "4280" (ICD-9, version=9)
+  → startswith "428" in chf_patterns
+  → cm_chf = 1
+```
+
+MIMIC-4 contains both ICD-9 and ICD-10 codes. ICD-9 E-codes (E800+, external causes) are correctly distinguished from ICD-10 E-codes (E10=diabetes, E40=malnutrition, E66=obesity) using a regex classifier before matching.
+
+### MIMIC-3 — ICD prefix matching (ICD-9 only)
+
+Same approach as MIMIC-4, but MIMIC-3 only contains ICD-9 codes, so only the ICD-9 half of each Elixhauser pattern list is used. No version disambiguation needed.
+
+```
+ICD code "42830" (ICD-9)
+  → startswith "428" in chf_patterns
+  → cm_chf = 1
+```
+
+### eICU — APACHE predictor variables (direct comorbidity fields)
+
+eICU does not use ICD codes. Instead, the APACHE scoring system records comorbidities directly in `apachepredvar` at ICU admission. Only 10 comorbidities are available (fewer than the 31 Elixhauser categories):
+
+```
+apachepredvar.diabetes = 1
+  → cm_diabetes = 1
+```
+
+These are more reliable than ICD-derived flags because they are actively collected during APACHE scoring, not inferred from billing codes. The column names use `cm_` prefix for consistency but map to APACHE-defined categories, not Elixhauser.
+
+eICU also provides 25 continuous physiological variables from `apacheapsvar` (prefixed `apache_`) and an overall `apache_score` — these are unique to eICU and not available in MIMIC or Synthea.
+
+### Synthea (Neo4j) — SNOMED description text matching
+
+Synthea stores diagnoses as SNOMED CT codes with text descriptions (e.g., `"Heart failure (disorder)"`). Since there are no ICD codes, comorbidities are detected by **regex matching against the description field**:
+
+```
+Diagnosis.description = "Systolic heart failure (disorder)"
+  → matches "heart failure" in chf_patterns
+  → cm_chf = 1
+```
+
+Each encounter's diagnoses are concatenated into one string, then all 31 comorbidity regexes are tested against it. This approach works because SNOMED CT uses standardized, consistent clinical terminology.
+
+**Note:** This is less precise than ICD prefix matching. A SNOMED concept may not match if the description phrasing differs from the pattern list. For higher precision, use the official SNOMED CT → ICD-10 CM mapping file to convert SNOMED codes to ICD-10 first, then apply the standard Elixhauser ICD patterns.
+
+---
+
+## Column Reference
+
+### IDs / Time (not features)
+
+| Column | MIMIC-4 | MIMIC-3 | eICU | Synthea | Description |
+|---|---|---|---|---|---|
+| `hadm_id` | ✅ | ✅ | — | — | Hospital admission ID |
+| `patientunitstayid` | — | — | ✅ | — | eICU ICU stay ID |
+| `encounter_id` | — | — | — | ✅ | Synthea encounter UUID |
+| `patient_id` | — | — | — | ✅ | Synthea patient UUID |
+| `admittime` | ✅ | ✅ | — | ✅ | Admission datetime — used for time-based split |
+
+### Target
+
+| Column | MIMIC-4 | MIMIC-3 | eICU | Synthea | Description |
+|---|---|---|---|---|---|
+| `los_days` | ✅ | ✅ | — | ✅ | Hospital length of stay in days |
+| `icu_los_days` | — | — | ✅ | — | ICU length of stay in days (filtered to 0–90) |
+
+### Demographics
+
+| Column | MIMIC-4 | MIMIC-3 | eICU | Synthea | Description |
+|---|---|---|---|---|---|
+| `anchor_age` | ✅ | ✅ | ✅ | ✅ | Age at admission (MIMIC-3: from DOB, capped at 89; eICU: ">89" → 89) |
+| `gender_bin` | ✅ | ✅ | ✅ | ✅ | 0 = Female, 1 = Male |
+| `insurance_cat` | ✅ | ✅ | — | — | 0=Medicare, 1=Medicaid, 2=Private, 3=Other |
+| `admission_location_cat` | ✅ | ✅ | — | — | Label-encoded admission location |
+| `ethnicity_cat` | — | — | ✅ | — | Label-encoded ethnicity |
+| `bmi` | — | — | ✅ | — | Body mass index at admission (clipped 10–80) |
+| `is_married` | — | — | — | ✅ | 1 if marital status = Married |
+| `income` | — | — | — | ✅ | Annual household income (USD) |
+
+### Admission Context
+
+| Column | MIMIC-4 | MIMIC-3 | eICU | Synthea | Description |
+|---|---|---|---|---|---|
+| `is_emergency` | ✅ | ✅ | — | — | 1 if emergency/urgent admission |
+| `unittype_cat` | — | — | ✅ | — | Label-encoded ICU unit type |
+| `unitadmitsource_cat` | — | — | ✅ | — | Label-encoded ICU admit source |
+| `total_cost` | — | — | — | ✅ | Total encounter cost (USD) |
+| `admission_dayofweek` | ✅ | ✅ | — | ✅ | 0 = Monday … 6 = Sunday |
+| `admission_month` | ✅ | ✅ | — | ✅ | 1–12 |
+| `admission_year` | ✅ | ✅ | — | ✅ | Calendar year |
+| `is_weekend` | ✅ | ✅ | — | ✅ | 1 if Saturday or Sunday |
+
+### Elixhauser Comorbidities (31 binary flags)
+
+All coded as 0/1. See Comorbidity Logic section above for derivation details.
+
+| Column | Condition |
+|---|---|
+| `cm_chf` | Congestive Heart Failure |
+| `cm_arrhythmia` | Cardiac Arrhythmias |
+| `cm_valve` | Valvular Disease |
+| `cm_pulm_circ` | Pulmonary Circulation Disorders |
+| `cm_pvd` | Peripheral Vascular Disease |
+| `cm_htn_uncomp` | Hypertension (Uncomplicated) |
+| `cm_htn_comp` | Hypertension (Complicated) |
+| `cm_paralysis` | Paralysis |
+| `cm_neuro_other` | Other Neurological Disorders |
+| `cm_copd` | Chronic Pulmonary Disease |
+| `cm_dm_uncomp` | Diabetes (Uncomplicated) |
+| `cm_dm_comp` | Diabetes (Complicated) |
+| `cm_hypothyroid` | Hypothyroidism |
+| `cm_renal` | Renal Failure |
+| `cm_liver` | Liver Disease |
+| `cm_ulcer` | Peptic Ulcer |
+| `cm_hiv` | AIDS / HIV |
+| `cm_lymphoma` | Lymphoma |
+| `cm_metastatic` | Metastatic Cancer |
+| `cm_solid_tumor` | Solid Tumor (without metastasis) |
+| `cm_rheumatoid` | Rheumatoid / Collagen Vascular Disease |
+| `cm_coagulopathy` | Coagulopathy |
+| `cm_obesity` | Obesity |
+| `cm_weight_loss` | Weight Loss / Malnutrition |
+| `cm_fluid_electrolyte` | Fluid and Electrolyte Disorders |
+| `cm_blood_loss` | Blood Loss Anemia |
+| `cm_anemia` | Deficiency Anemia |
+| `cm_alcohol` | Alcohol Abuse |
+| `cm_drug` | Drug Abuse |
+| `cm_psychosis` | Psychoses |
+| `cm_depression` | Depression |
+
+### Count Features (continuous, RobustScaled)
+
+| Column | MIMIC-4 | MIMIC-3 | eICU | Synthea | Description |
+|---|---|---|---|---|---|
+| `num_diagnoses` | ✅ | ✅ | — | ✅ | Number of diagnosis codes per admission |
+| `num_procedures` | ✅ | ✅ | — | ✅ | Number of procedure codes per admission |
+| `num_transfers` | ✅ | ✅ | — | — | Number of ward/unit transfers |
+| `num_prescriptions` | ✅ | ✅ | — | — | Number of medication orders |
+| `num_labs` | ✅ | ✅ | ✅ | — | Number of lab tests ordered |
+| `num_medications` | — | — | ✅ | — | Number of medication records (eICU) |
+| `num_drugs` | — | — | — | ✅ | Number of drug records (Synthea) |
+
+### ICU & ED
+
+| Column | MIMIC-4 | MIMIC-3 | eICU | Synthea | Description |
+|---|---|---|---|---|---|
+| `has_icu` | ✅ | ✅ | — | — | 1 if patient admitted to any ICU |
+| `had_ed_visit` | ✅ | — | — | — | 1 if came through Emergency Department |
+| `hospital_expire_flag` | ✅ | ✅ | ✅ | — | 1 if patient died during admission |
+
+### eICU-only: APACHE Variables
+
+Only available in `eicu_los.csv`. All prefixed with `apache_`.
+
+| Column | Type | Description |
+|---|---|---|
+| `apache_score` | continuous | Overall APACHE IV score |
+| `apache_pred_mortality` | continuous | Predicted hospital mortality (%) |
+| `apache_intubated` | binary | 1 if intubated at ICU admission |
+| `apache_vent` | binary | 1 if on mechanical ventilation |
+| `apache_dialysis` | binary | 1 if on dialysis |
+| `apache_gcs_eyes` | continuous | GCS — eye response (1–4) |
+| `apache_gcs_motor` | continuous | GCS — motor response (1–6) |
+| `apache_gcs_verbal` | continuous | GCS — verbal response (1–5) |
+| `apache_heartrate` | continuous | Heart rate (bpm) |
+| `apache_meanbp` | continuous | Mean arterial blood pressure (mmHg) |
+| `apache_temperature` | continuous | Body temperature (°C) |
+| `apache_resprate` | continuous | Respiratory rate (breaths/min) |
+| `apache_wbc` | continuous | White blood cell count (×10³/μL) |
+| `apache_hematocrit` | continuous | Hematocrit (%) |
+| `apache_sodium` | continuous | Serum sodium (mEq/L) |
+| `apache_ph` | continuous | Arterial pH |
+| `apache_pao2` | continuous | Arterial O₂ partial pressure (mmHg) |
+| `apache_pco2` | continuous | Arterial CO₂ partial pressure (mmHg) |
+| `apache_fio2` | continuous | Fraction of inspired oxygen (%) |
+| `apache_creatinine` | continuous | Serum creatinine (mg/dL) |
+| `apache_bilirubin` | continuous | Serum bilirubin (mg/dL) |
+| `apache_albumin` | continuous | Serum albumin (g/dL) |
+| `apache_glucose` | continuous | Blood glucose (mg/dL) |
+| `apache_bun` | continuous | Blood urea nitrogen (mg/dL) |
+| `apache_urine` | continuous | 24-hour urine output (mL) |
+
+### ED Triage Vitals — MIMIC-4 only
+
+Recorded at ED triage. 0 for non-ED admissions. Not available in MIMIC-3 or Synthea.
+
+| Column | Description |
+|---|---|
+| `triage_temperature` | Body temperature (°F) |
+| `triage_heartrate` | Heart rate (bpm) |
+| `triage_resprate` | Respiratory rate (breaths/min) |
+| `triage_o2sat` | Oxygen saturation (%) |
+| `triage_sbp` | Systolic blood pressure (mmHg) |
+| `triage_dbp` | Diastolic blood pressure (mmHg) |
+| `triage_pain` | Pain score (0–10) |
+| `triage_acuity` | ESI triage acuity level (1–5, lower = more urgent) |
+
+---
+
+## SHAP Interpretability
+
+```python
+import shap
+import lightgbm as lgb
+from dataset import load_mimic4_los
+
+(X_train, y_train, X_val, y_val, X_test, y_test,
+ feature_cols, continuous_cols, binary_cols, scaler) = load_mimic4_los(
+     csv_path="processed/mimic4_los.csv"
+ )
+
+model = lgb.LGBMRegressor().fit(X_train, y_train)
+
+explainer   = shap.TreeExplainer(model)
+shap_values = explainer.shap_values(X_test)
+
+# feature_cols matches X_test column order exactly — no reordering needed
+shap.summary_plot(shap_values, X_test, feature_names=feature_cols)
+```
+
+`feature_cols` is always returned in the same order as the columns in `X_train/X_val/X_test` (continuous first, then binary), so it can be passed directly to SHAP without any reordering.

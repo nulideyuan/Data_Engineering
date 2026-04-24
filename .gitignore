@@ -1,0 +1,25 @@
+# Raw data — never commit medical data files
+raw/
+
+# Processed CSVs — too large for git (use git-lfs or just document)
+processed/*.csv
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.ipynb_checkpoints/
+*.egg-info/
+
+# Environment
+.env
+venv/
+.venv/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Credentials
+*.json
+!package.json
