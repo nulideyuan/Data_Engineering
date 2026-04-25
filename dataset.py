@@ -1,129 +1,128 @@
-# data/dataset.py
-import pandas as pd
-from sklearn.model_selection import train_test_split, cross_val_score
-from sklearn.linear_model import LinearRegression
-from sklearn.metrics import mean_absolute_error, mean_squared_error
-import numpy as np
-from sklearn.preprocessing import RobustScaler
-from torch.utils.data import Dataset
-import torch.nn as nn
-import torch.nn.functional as F
-import optuna
-import torch
-import torch.nn as nn
-import torch.optim as optim
-import gc
-import os
-import numpy as np
-import matplotlib.pyplot as plt
-import os, time, json, random
+"""
+dataset.py — LOS dataset loaders for MIMIC-4, MIMIC-3, eICU, Synthea.
 
+All loaders return the same 10-tuple:
+    X_train, y_train, X_val, y_val, X_test, y_test,
+    feature_cols,    # ordered list matching X columns — pass directly to SHAP
+    continuous_cols, # RobustScaled
+    binary_cols,     # not scaled (0/1 only)
+    scaler           # fitted RobustScaler
+
+Usage
+-----
+from dataset import load_mimic4_los, load_mimic3_los, load_eicu_los, load_synthea_los
+
+X_train, y_train, X_val, y_val, X_test, y_test, \
+feature_cols, continuous_cols, binary_cols, scaler = load_mimic4_los()
+"""
+
+import numpy as np
+import pandas as pd
+import torch
+from torch.utils.data import Dataset
+from sklearn.preprocessing import RobustScaler
+
+
+# ── PyTorch dataset wrapper ──────────────────────────────────────────────────
 
 class NumpyDataset(Dataset):
     def __init__(self, X, y=None):
         self.X = torch.from_numpy(np.asarray(X)).float()
-        if y is None:
-            self.y = None
-        else:
-            self.y = torch.from_numpy(np.asarray(y)).float()
+        self.y = None if y is None else torch.from_numpy(np.asarray(y)).float()
+
+    def __len__(self):
+        return len(self.X)
 
     def __getitem__(self, i):
-        if self.y is None:
-            return self.X[i]
-        return self.X[i], self.y[i]
+        return self.X[i] if self.y is None else (self.X[i], self.y[i])
 
 
+# ── Generic loader ───────────────────────────────────────────────────────────
 
-
-
-def load_mimic4_los(
-    csv_path: str = "processed/mimic4_los.csv",
+def load_los_dataset(
+    csv_path: str,
     target: str = "los_days",
-    time_col: str = "admittime",
+    time_col: str = None,       # None → split on existing row order (eICU)
     split: tuple = (0.7, 0.1, 0.2),
     verbose: bool = True,
 ):
     """
-    Load processed/mimic4_los.csv and return train/val/test splits ready for
-    LOS regression and SHAP interpretability.
+    Generic LOS dataset loader. Works for MIMIC-4, MIMIC-3, eICU, Synthea.
 
-    Key guarantee: feature_cols is returned in the exact same order as the
-    columns in X_train/X_val/X_test (continuous first, then binary), so you
-    can pass it directly to shap.summary_plot as feature_names.
+    Continuous vs binary is detected from data:
+      binary  = column whose non-null values are a subset of {0, 1}
+      continuous = everything else
 
-    Returns
-    -------
-    X_train, y_train, X_val, y_val, X_test, y_test,
-    feature_cols,      # ordered list matching X columns — use for SHAP
-    continuous_cols,   # subset that was RobustScaled
-    binary_cols,       # subset that was NOT scaled
-    scaler             # fitted RobustScaler (for inverse-transform if needed)
+    RobustScaler is fitted on the training split of continuous columns only.
+    feature_cols order = continuous_cols + binary_cols, matching X column order.
     """
     assert abs(sum(split) - 1.0) < 1e-6, "split ratios must sum to 1.0"
 
-    df = pd.read_csv(csv_path, parse_dates=[time_col])
-    df = df.sort_values(time_col).reset_index(drop=True)
+    df = pd.read_csv(csv_path)
 
-    # ---- target ----
+    # Sort by time if available
+    if time_col and time_col in df.columns:
+        df[time_col] = pd.to_datetime(df[time_col])
+        df = df.sort_values(time_col).reset_index(drop=True)
+
     y = df[target].to_numpy(dtype=np.float32)
 
-    # ---- auto-detect feature groups ----
-    # Columns that are clearly continuous by name pattern
-    CONTINUOUS_EXACT = {
-        "anchor_age",
-        "admission_dayofweek",
-        "admission_month",
-        "admission_year",
-    }
-    skip = {target, time_col, "hadm_id"}
+    # Columns to skip: target, time, and any ID-like columns
+    ID_COLS = {"hadm_id", "patientunitstayid", "hospitalid",
+               "encounter_id", "patient_id"}
+    skip = {target}
+    if time_col:
+        skip.add(time_col)
+    skip |= ID_COLS & set(df.columns)
 
-    continuous_cols = []
-    binary_cols = []
-    for c in df.columns:
-        if c in skip:
-            continue
-        if (
-            c in CONTINUOUS_EXACT
-            or c.startswith("num_")
-            or c.startswith("triage_")
-        ):
-            continuous_cols.append(c)
-        else:
+    feature_raw = [c for c in df.columns if c not in skip]
+
+    # Auto-detect binary vs continuous from actual values
+    continuous_cols, binary_cols = [], []
+    for c in feature_raw:
+        uniq = set(df[c].dropna().unique())
+        if uniq <= {0, 1, 0.0, 1.0}:
             binary_cols.append(c)
+        else:
+            continuous_cols.append(c)
 
-    # feature_cols order matches np.hstack([X_cont, X_bin]) — critical for SHAP
-    feature_cols = continuous_cols + binary_cols
+    feature_cols = continuous_cols + binary_cols  # order matches X hstack
 
-    X_cont = df[continuous_cols].apply(pd.to_numeric, errors="coerce").fillna(0).to_numpy(np.float32)
-    X_bin  = df[binary_cols].apply(pd.to_numeric, errors="coerce").fillna(0).to_numpy(np.float32)
+    X_cont = (df[continuous_cols]
+              .apply(pd.to_numeric, errors="coerce")
+              .fillna(0)
+              .to_numpy(np.float32))
+    X_bin  = (df[binary_cols]
+              .apply(pd.to_numeric, errors="coerce")
+              .fillna(0)
+              .to_numpy(np.float32))
 
-    # ---- temporal split ----
-    N = len(df)
+    # Temporal (or sequential) split
+    N    = len(df)
     i_tr = int(split[0] * N)
     i_va = int((split[0] + split[1]) * N)
 
-    # ---- RobustScaler fitted on TRAIN continuous only ----
-    scaler = RobustScaler()
+    scaler   = RobustScaler()
     Xtr_cont = scaler.fit_transform(X_cont[:i_tr])
     Xva_cont = scaler.transform(X_cont[i_tr:i_va])
     Xte_cont = scaler.transform(X_cont[i_va:])
 
-    Xtr_bin = X_bin[:i_tr]
-    Xva_bin = X_bin[i_tr:i_va]
-    Xte_bin = X_bin[i_va:]
-
-    X_train = np.hstack([Xtr_cont, Xtr_bin]).astype(np.float32)
-    X_val   = np.hstack([Xva_cont, Xva_bin]).astype(np.float32)
-    X_test  = np.hstack([Xte_cont, Xte_bin]).astype(np.float32)
+    X_train = np.hstack([Xtr_cont, X_bin[:i_tr]]).astype(np.float32)
+    X_val   = np.hstack([Xva_cont, X_bin[i_tr:i_va]]).astype(np.float32)
+    X_test  = np.hstack([Xte_cont, X_bin[i_va:]]).astype(np.float32)
 
     y_train, y_val, y_test = y[:i_tr], y[i_tr:i_va], y[i_va:]
 
     if verbose:
-        print(f"Total: {N:,} | TRAIN {X_train.shape} | VAL {X_val.shape} | TEST {X_test.shape}")
-        print(f"Time  TRAIN: {df[time_col].iloc[0].date()} → {df[time_col].iloc[i_tr-1].date()}")
-        print(f"      VAL  : {df[time_col].iloc[i_tr].date()} → {df[time_col].iloc[i_va-1].date()}")
-        print(f"      TEST : {df[time_col].iloc[i_va].date()} → {df[time_col].iloc[-1].date()}")
-        print(f"Features: {len(feature_cols)} total ({len(continuous_cols)} continuous, {len(binary_cols)} binary)")
+        print(f"Dataset : {csv_path}")
+        print(f"Total   : {N:,} | TRAIN {X_train.shape} | VAL {X_val.shape} | TEST {X_test.shape}")
+        if time_col and time_col in df.columns:
+            fmt = lambda i: str(df[time_col].iloc[i].date())
+            print(f"Time  TRAIN: {fmt(0)} → {fmt(i_tr - 1)}")
+            print(f"      VAL  : {fmt(i_tr)} → {fmt(i_va - 1)}")
+            print(f"      TEST : {fmt(i_va)} → {fmt(-1)}")
+        print(f"Features: {len(feature_cols)} total  "
+              f"({len(continuous_cols)} continuous, {len(binary_cols)} binary)")
 
     return (
         X_train, y_train,
@@ -134,3 +133,25 @@ def load_mimic4_los(
         binary_cols,
         scaler,
     )
+
+
+# ── Per-dataset convenience wrappers ─────────────────────────────────────────
+
+def load_mimic4_los(csv_path: str = "processed/mimic4_los.csv", **kw):
+    """MIMIC-4 hospital LOS. Time-based split on admittime."""
+    return load_los_dataset(csv_path, target="los_days", time_col="admittime", **kw)
+
+
+def load_mimic3_los(csv_path: str = "processed/mimic3_los.csv", **kw):
+    """MIMIC-3 hospital LOS. Time-based split on admittime."""
+    return load_los_dataset(csv_path, target="los_days", time_col="admittime", **kw)
+
+
+def load_eicu_los(csv_path: str = "processed/eicu_los.csv", **kw):
+    """eICU ICU LOS. No timestamp — split on existing row order."""
+    return load_los_dataset(csv_path, target="icu_los_days", time_col=None, **kw)
+
+
+def load_synthea_los(csv_path: str = "processed/synthea_los.csv", **kw):
+    """Synthea synthetic inpatient LOS. Time-based split on admittime."""
+    return load_los_dataset(csv_path, target="los_days", time_col="admittime", **kw)
