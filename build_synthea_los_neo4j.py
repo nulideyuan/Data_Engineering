@@ -41,72 +41,52 @@ def query(cypher: str) -> pd.DataFrame:
 # ============================================================
 elixhauser_text = {
     "chf":              ["heart failure", "cardiac failure", "congestive heart"],
-    "arrhythmia":       ["arrhythmia", "atrial fibrillation", "atrial flutter",
+    "arrhythmia":       ["atrial fibrillation", "atrial flutter", "arrhythmia",
                          "ventricular tachycardia", "heart block", "sick sinus"],
     "valve":            ["valvular", "mitral stenosis", "mitral regurgitation",
-                         "aortic stenosis", "aortic regurgitation", "tricuspid",
-                         "endocarditis"],
-    "pulm_circ":        ["pulmonary embolism", "pulmonary hypertension",
-                         "cor pulmonale"],
+                         "aortic stenosis", "aortic regurgitation", "endocarditis"],
+    "pulm_circ":        ["pulmonary embolism", "pulmonary hypertension", "cor pulmonale"],
     "pvd":              ["peripheral vascular", "peripheral arterial",
-                         "atherosclerosis", "intermittent claudication",
-                         "aortic aneurysm"],
-    "htn_uncomp":       ["essential hypertension", "primary hypertension",
-                         "hypertension (disorder)"],
+                         "atherosclerosis", "claudication", "aortic aneurysm"],
+    "htn_uncomp":       ["hypertension"],          # broad: catches all hypertension
     "htn_comp":         ["hypertensive heart", "hypertensive renal",
-                         "hypertensive chronic kidney", "hypertensive disease"],
-    "paralysis":        ["paralysis", "hemiplegia", "paraplegia",
-                         "quadriplegia", "hemiparesis"],
-    "neuro_other":      ["parkinson", "multiple sclerosis", "epilepsy",
-                         "dementia", "alzheimer", "cerebral palsy",
-                         "huntington", "motor neuron"],
-    "copd":             ["chronic obstructive pulmonary", "emphysema",
-                         "chronic bronchitis", "bronchiectasis"],
-    "dm_uncomp":        ["diabetes mellitus type 2", "type 2 diabetes",
-                         "type ii diabetes", "non-insulin-dependent diabetes"],
+                         "hypertensive chronic kidney"],
+    "paralysis":        ["paralysis", "hemiplegia", "paraplegia", "quadriplegia"],
+    "neuro_other":      ["parkinson", "multiple sclerosis", "epilepsy", "seizure",
+                         "dementia", "alzheimer", "cerebral palsy", "huntington"],
+    "copd":             ["chronic obstructive", "emphysema", "chronic bronchitis",
+                         "bronchiectasis", "asthma"],
+    "dm_uncomp":        ["diabetes", "prediabetes"],   # broad: catches all diabetes variants
     "dm_comp":          ["diabetic nephropathy", "diabetic retinopathy",
-                         "diabetic neuropathy", "diabetic ketoacidosis",
-                         "diabetic foot", "diabetic macular"],
+                         "diabetic neuropathy", "diabetic ketoacidosis"],
     "hypothyroid":      ["hypothyroidism", "myxedema", "hashimoto"],
-    "renal":            ["renal failure", "chronic kidney disease",
-                         "end stage renal", "kidney failure", "renal transplant"],
-    "liver":            ["liver failure", "cirrhosis", "hepatic failure",
+    "renal":            ["renal failure", "chronic kidney", "end stage renal",
+                         "kidney failure", "renal transplant"],
+    "liver":            ["cirrhosis", "hepatic failure", "liver failure",
                          "portal hypertension", "hepatitis b", "hepatitis c",
                          "alcoholic liver"],
-    "ulcer":            ["peptic ulcer", "gastric ulcer", "duodenal ulcer",
-                         "gastrointestinal ulcer"],
-    "hiv":              ["human immunodeficiency virus", "hiv infection",
-                         "acquired immunodeficiency"],
-    "lymphoma":         ["lymphoma", "hodgkin", "non-hodgkin"],
+    "ulcer":            ["peptic ulcer", "gastric ulcer", "duodenal ulcer"],
+    "hiv":              ["human immunodeficiency", "hiv", "acquired immunodeficiency"],
+    "lymphoma":         ["lymphoma", "hodgkin", "leukemia", "myeloma"],
     "metastatic":       ["metastatic", "metastasis", "secondary malignant"],
-    "solid_tumor":      ["carcinoma", "adenocarcinoma", "malignant neoplasm",
-                         "malignant tumor", "melanoma", "sarcoma"],
-    "rheumatoid":       ["rheumatoid arthritis", "systemic lupus",
-                         "scleroderma", "vasculitis", "polymyositis",
-                         "ankylosing spondylitis"],
+    "solid_tumor":      ["carcinoma", "malignant neoplasm", "malignant tumor",
+                         "melanoma", "sarcoma", "neoplasm of"],
+    "rheumatoid":       ["rheumatoid arthritis", "lupus", "scleroderma",
+                         "vasculitis", "polymyositis", "ankylosing spondylitis"],
     "coagulopathy":     ["coagulopathy", "thrombocytopenia", "hemophilia",
-                         "disseminated intravascular coagulation",
-                         "von willebrand"],
-    "obesity":          ["obesity", "morbid obesity"],
-    "weight_loss":      ["malnutrition", "cachexia", "protein-energy",
-                         "failure to thrive"],
+                         "disseminated intravascular", "von willebrand"],
+    "obesity":          ["obesity"],
+    "weight_loss":      ["malnutrition", "cachexia", "failure to thrive"],
     "fluid_electrolyte":["hyponatremia", "hypernatremia", "hypokalemia",
-                         "hyperkalemia", "electrolyte imbalance",
-                         "fluid overload", "dehydration"],
-    "blood_loss":       ["blood loss anemia", "acute blood loss",
-                         "hemorrhagic anemia"],
-    "anemia":           ["iron deficiency anemia", "vitamin b12 deficiency anemia",
-                         "folate deficiency anemia", "aplastic anemia",
-                         "hemolytic anemia", "sickle cell", "thalassemia"],
-    "alcohol":          ["alcohol use disorder", "alcoholism",
-                         "alcohol dependence", "alcohol abuse"],
-    "drug":             ["opioid use disorder", "cocaine dependence",
-                         "substance use disorder", "drug abuse",
-                         "cannabis dependence", "heroin"],
+                         "hyperkalemia", "electrolyte", "dehydration"],
+    "blood_loss":       ["blood loss anemia", "hemorrhagic anemia"],
+    "anemia":           ["anemia"],                # broad: catches all anemia types
+    "alcohol":          ["alcohol use", "alcoholism", "alcohol dependence", "alcohol abuse"],
+    "drug":             ["opioid", "opioid abuse", "substance use", "drug abuse",
+                         "cannabis dependence"],
     "psychosis":        ["schizophrenia", "schizoaffective", "psychosis",
-                         "bipolar i disorder", "delusional disorder"],
-    "depression":       ["major depression", "depressive disorder",
-                         "persistent depressive", "dysthymia"],
+                         "bipolar", "delusional disorder"],
+    "depression":       ["depression", "depressive", "dysthymia"],
 }
 
 def build_elixhauser_regex():
@@ -173,9 +153,12 @@ enc_df["total_cost"]   = pd.to_numeric(enc_df["total_cost"], errors="coerce").fi
 # 2. Diagnoses per encounter → Elixhauser flags + count
 # ============================================================
 print("2. Diagnoses → Elixhauser comorbidity flags ...")
+# Get ALL diagnoses for each patient (from any encounter type, not just Inpatient)
+# Synthea records diagnoses at first occurrence — not repeated on every encounter
 diag_df = query("""
-MATCH (e:Inpatient)-[:HAS_DIAGNOSIS]->(d:Diagnosis)
-RETURN e.id AS encounter_id, d.code AS snomed_code, d.description AS description
+MATCH (p:Patient)-[:HAS_ENCOUNTER]->(e:Inpatient)
+MATCH (p)-[:HAS_ENCOUNTER]->(any_enc)-[:HAS_DIAGNOSIS]->(d:Diagnosis)
+RETURN DISTINCT e.id AS encounter_id, d.code AS snomed_code, d.description AS description
 """)
 
 num_diagnoses = (
@@ -260,3 +243,4 @@ for c in cm_cols:
         print(f"  {c:<28} {df[c].mean():.1%}")
 
 driver.close()
+

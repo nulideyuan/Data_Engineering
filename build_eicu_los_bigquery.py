@@ -284,11 +284,25 @@ for c in ["num_labs", "num_medications"]:
 cm_cols = [c for c in df.columns if c.startswith("cm_")]
 df[cm_cols] = df[cm_cols].fillna(0).astype(np.int8)
 
-# Fill APACHE physiology with 0 (missing = not measured / normal assumed)
-apache_phys_cols = [c for c in df.columns if c.startswith("apache_")]
-df[apache_phys_cols] = df[apache_phys_cols].apply(
-    pd.to_numeric, errors="coerce"
-).fillna(0)
+# APACHE physiology: -1 is eICU sentinel for "not measured" → NaN
+# Keep as NaN — LightGBM/XGBoost handle missing natively; filling 0 is wrong
+# (apache_meanbp=0 means no blood pressure, not "not measured")
+apache_binary = ["apache_intubated", "apache_vent", "apache_dialysis"]
+apache_cont   = [c for c in df.columns if c.startswith("apache_") and c not in apache_binary]
+df[apache_cont] = (
+    df[apache_cont]
+    .apply(pd.to_numeric, errors="coerce")
+    .replace(-1, np.nan)
+)
+df["apache_urine"] = df["apache_urine"].clip(lower=0)   # corrupt large negatives
+# Binary flags: -1 → 0 (not applicable = not used)
+df[apache_binary] = (
+    df[apache_binary]
+    .apply(pd.to_numeric, errors="coerce")
+    .replace(-1, 0)
+    .fillna(0)
+    .astype(np.int8)
+)
 
 # Sort by unitdischargeoffset as proxy for time (no absolute timestamp in eICU)
 df = df.sort_values("unitdischargeoffset").reset_index(drop=True)

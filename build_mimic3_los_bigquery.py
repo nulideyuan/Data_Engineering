@@ -106,20 +106,20 @@ elixhauser_icd9 = {
     "depression":["2962","2963","2965","3004","30112","309","311"],
 }
 
-def _build_regex(codes):
-    if not codes:
-        return None
-    escaped = sorted(set(re.escape(c) for c in codes), key=len, reverse=True)
-    return re.compile("^(?:" + "|".join(escaped) + ")")
-
-icd9_regex = {cm: _build_regex(codes) for cm, codes in elixhauser_icd9.items()}
+_cm_regex = {}
+for _cm, _codes in elixhauser_icd9.items():
+    if _codes:
+        _sorted = sorted(set(re.escape(c) for c in _codes), key=len, reverse=True)
+        _cm_regex[_cm] = re.compile("^(?:" + "|".join(_sorted) + ")")
+    else:
+        _cm_regex[_cm] = None
 
 
 def compute_elixhauser(diag: pd.DataFrame) -> pd.DataFrame:
     """diag must have columns: hadm_id, icd9_code (str)"""
     all_hadm = diag["hadm_id"].unique()
     cm_df = pd.DataFrame({"hadm_id": all_hadm})
-    for cm, rx in icd9_regex.items():
+    for cm, rx in _cm_regex.items():
         if rx is None:
             cm_df[f"cm_{cm}"] = np.int8(0)
             continue

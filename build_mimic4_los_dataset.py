@@ -234,66 +234,25 @@ elixhauser_patterns = {
 }
 
 
-def _is_icd9_pattern_code(code: str) -> bool:
-    """
-    True if this pattern code belongs to the ICD-9 namespace.
-    Rules:
-      - Starts with a digit → ICD-9
-      - Starts with V       → ICD-9 (V-codes)
-      - Starts with E + 3 digits where value ≥ 800 → ICD-9 external cause
-      - Everything else     → ICD-10
-    """
-    if not code:
-        return False
-    if code[0].isdigit():
-        return True
-    if code[0] == "V":
-        return True
-    # ICD-9 E-codes: E followed by exactly 3+ digits, value ≥ 800
-    m = re.match(r"^E(\d{3,})", code)
-    if m and int(m.group(1)[:3]) >= 800:
-        return True
-    return False
-
-
-def _build_prefix_regex(codes):
-    if not codes:
-        return None
-    escaped = sorted(set(re.escape(c) for c in codes), key=len, reverse=True)
-    return re.compile("^(?:" + "|".join(escaped) + ")")
-
-
-# Pre-compile per-comorbidity, per-version regex patterns
-icd9_regex = {}
-icd10_regex = {}
-for cm, codes in elixhauser_patterns.items():
-    c9 = [c for c in codes if _is_icd9_pattern_code(c)]
-    c10 = [c for c in codes if not _is_icd9_pattern_code(c)]
-    icd9_regex[cm] = _build_prefix_regex(c9)
-    icd10_regex[cm] = _build_prefix_regex(c10)
+# Pre-compile one prefix regex per comorbidity (all codes, no version split)
+_cm_regex = {}
+for _cm, _codes in elixhauser_patterns.items():
+    _sorted = sorted(set(re.escape(c) for c in _codes), key=len, reverse=True)
+    _cm_regex[_cm] = re.compile("^(?:" + "|".join(_sorted) + ")")
 
 
 def compute_elixhauser(diag: pd.DataFrame) -> pd.DataFrame:
     """
-    Given diagnoses_icd (columns: hadm_id, icd_code str, icd_version int),
+    Given diagnoses_icd (columns: hadm_id, icd_code str),
     return DataFrame with hadm_id + 31 cm_* binary columns (int8).
+    Matches all ICD codes (9 and 10) via prefix against elixhauser_patterns.
     """
-    diag9 = diag[diag["icd_version"] == 9][["hadm_id", "icd_code"]].copy()
-    diag10 = diag[diag["icd_version"] == 10][["hadm_id", "icd_code"]].copy()
-
     all_hadm = diag["hadm_id"].unique()
     cm_df = pd.DataFrame({"hadm_id": all_hadm})
-
-    for cm in elixhauser_patterns:
-        matched = set()
-        if icd9_regex[cm] is not None and len(diag9):
-            mask9 = diag9["icd_code"].str.match(icd9_regex[cm], na=False)
-            matched |= set(diag9.loc[mask9, "hadm_id"])
-        if icd10_regex[cm] is not None and len(diag10):
-            mask10 = diag10["icd_code"].str.match(icd10_regex[cm], na=False)
-            matched |= set(diag10.loc[mask10, "hadm_id"])
+    for cm, rx in _cm_regex.items():
+        mask = diag["icd_code"].str.match(rx, na=False)
+        matched = set(diag.loc[mask, "hadm_id"])
         cm_df[f"cm_{cm}"] = cm_df["hadm_id"].isin(matched).astype(np.int8)
-
     return cm_df
 
 

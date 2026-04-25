@@ -6,7 +6,7 @@ Four processed datasets for Length of Stay prediction and SHAP interpretability 
 |---|---|---|---|---|---|
 | MIMIC-4 | `mimic4_los.csv` | 545,847 | 59 | Local CSV files | General inpatient |
 | MIMIC-3 | `mimic3_los.csv` | 58,878 | 50 | Google BigQuery | ICU patients |
-| eICU | `eicu_los.csv` | 199,628 | 47 | Google BigQuery | ICU patients (multi-site) |
+| eICU | `eicu_los.csv` | 94,861 | 40 | Google BigQuery | ICU patients (multi-site) |
 | Synthea | `synthea_los.csv` | 6,480 | 47 | Neo4j (local) | Synthetic inpatient |
 
 ---
@@ -71,7 +71,7 @@ from dataset import load_mimic4_los
  binary_cols,      # not scaled
  scaler) = load_mimic4_los(csv_path="processed/mimic4_los.csv")
 
-# MIMIC-3:  csv_path="processed/mimic3_los.csv"
+# MIMIC-3: csv_path="processed/mimic3_los.csv"
 # Synthea:  csv_path="processed/synthea_los.csv", target="los_days"
 ```
 
@@ -83,15 +83,15 @@ Split: time-based 70 / 10 / 20 sorted by `admittime`.
 
 | Property | MIMIC-4 | MIMIC-3 | eICU | Synthea |
 |---|---|---|---|---|
-| LOS mean | 4.76 days | 10.15 days | 2.68 days | 4.92 days |
-| LOS median | 2.82 days | 6.49 days | 1.59 days | 4.04 days |
+| LOS mean | 4.76 days | 10.15 days | 3.15 days | 4.92 days |
+| LOS median | 2.82 days | 6.49 days | 1.89 days | 4.04 days |
 | LOS unit | Hospital stay | Hospital stay | ICU stay | Hospital stay |
 | ICU rate | 15.6% | 98% | 100% | — |
 | ED triage vitals | Yes | No | No | No |
 | Diagnosis coding | ICD-9 + ICD-10 | ICD-9 only | None (APACHE) | SNOMED CT |
 | Comorbidity method | Elixhauser (ICD prefix) | Elixhauser (ICD prefix) | APACHE `apachepredvar` fields | Elixhauser (SNOMED text) |
 | Severity score | — | — | APACHE score + pred mortality | — |
-| Physiology at admission | Triage vitals (ED only) | — | 21 APACHE APS variables | — |
+| Physiology at admission | Triage vitals (ED only) | — | 15 APACHE APS variables | — |
 | Data type | Real patients | Real ICU patients | Real ICU patients (multi-site) | Synthetic patients |
 
 ---
@@ -100,26 +100,47 @@ Split: time-based 70 / 10 / 20 sorted by `admittime`.
 
 The `cm_*` columns represent the same 31 Elixhauser comorbidity categories across all datasets, but are derived differently depending on what each database provides.
 
+### What is Elixhauser?
+
+The Elixhauser comorbidity index is a standard set of 31 clinical categories (CHF, diabetes, renal failure, etc.) used widely in hospital outcomes research. For each admission, each category becomes a binary flag: does this patient have this condition, based on diagnosis codes recorded at admission.
+
+### Pattern codes and prefix matching
+
+Each comorbidity has a list of ICD pattern codes. Some are **exact** codes; others are **category prefixes** that represent a whole subtree of the ICD hierarchy:
+
+```
+"chf": ["39891", "40201", "428", "I50", "I43", ...]
+```
+
+- `"39891"` — exact ICD-9 code, matches only `39891`
+- `"428"` — prefix, matches `4280`, `4281`, `42821`, `42823`, ... (all heart failure subcategories)
+- `"I50"` — prefix, matches `I500`, `I501`, `I509`, ... (ICD-10 heart failure)
+
+This works because ICD is a hierarchical tree. A parent code like `428` always prefixes all its children.
+
+The matching regex for each comorbidity is compiled once at build time, patterns sorted longest-first to prevent shorter prefixes from short-circuiting longer exact codes:
+
+```
+^(?:40493|40491|...|39891|I50|I43|428)
+```
+
+Any admission with at least one matching diagnosis code gets `cm_chf = 1`.
+
 ### MIMIC-4 — ICD prefix matching (ICD-9 + ICD-10)
 
-Each admission has diagnosis codes in `diagnoses_icd`. We match these against the Elixhauser code lists using **prefix matching**:
+MIMIC-4 stores both ICD-9 and ICD-10 codes in `diagnoses_icd` (mixed per admission). A single unified regex per comorbidity is applied to all codes regardless of version — the pattern codes themselves are unambiguous (`428` only exists in ICD-9 space; `I50` only in ICD-10 space, so there is no cross-version false-positive risk).
 
 ```
-ICD code "4280" (ICD-9, version=9)
-  → startswith "428" in chf_patterns
-  → cm_chf = 1
+"4280"  → starts with "428"  → cm_chf = 1
+"I5009" → starts with "I50"  → cm_chf = 1
 ```
-
-MIMIC-4 contains both ICD-9 and ICD-10 codes. ICD-9 E-codes (E800+, external causes) are correctly distinguished from ICD-10 E-codes (E10=diabetes, E40=malnutrition, E66=obesity) using a regex classifier before matching.
 
 ### MIMIC-3 — ICD prefix matching (ICD-9 only)
 
-Same approach as MIMIC-4, but MIMIC-3 only contains ICD-9 codes, so only the ICD-9 half of each Elixhauser pattern list is used. No version disambiguation needed.
+Same prefix-matching approach. MIMIC-3 contains only ICD-9 codes, so the pattern list (`elixhauser_icd9`) contains only ICD-9 entries — no ICD-10 codes included.
 
 ```
-ICD code "42830" (ICD-9)
-  → startswith "428" in chf_patterns
-  → cm_chf = 1
+"42830" → starts with "428" → cm_chf = 1
 ```
 
 ### eICU — APACHE predictor variables (direct comorbidity fields)
@@ -133,21 +154,45 @@ apachepredvar.diabetes = 1
 
 These are more reliable than ICD-derived flags because they are actively collected during APACHE scoring, not inferred from billing codes. The column names use `cm_` prefix for consistency but map to APACHE-defined categories, not Elixhauser.
 
-eICU also provides 25 continuous physiological variables from `apacheapsvar` (prefixed `apache_`) and an overall `apache_score` — these are unique to eICU and not available in MIMIC or Synthea.
+eICU also provides continuous physiological variables from `apacheapsvar` (prefixed `apache_`) and an overall `apache_score`. In the raw eICU data, `-1` is a sentinel value meaning "not measured" (not a real physiological reading). All `-1` values are converted to `NaN` before saving. Rows with any missing APACHE value are dropped (104,766 rows removed), leaving only patients with complete APACHE profiles. Seven blood-gas/liver variables with >50% missingness are dropped entirely as they are only collected for intubated or critically ill subsets:
+
+Dropped: `apache_ph`, `apache_pao2`, `apache_pco2`, `apache_fio2`, `apache_bilirubin`, `apache_albumin`, `apache_urine`
 
 ### Synthea (Neo4j) — SNOMED description text matching
 
-Synthea stores diagnoses as SNOMED CT codes with text descriptions (e.g., `"Heart failure (disorder)"`). Since there are no ICD codes, comorbidities are detected by **regex matching against the description field**:
+Synthea stores diagnoses as SNOMED CT codes with text descriptions (e.g., `"Chronic congestive heart failure (disorder)"`). Since there are no ICD codes, comorbidities are detected by **case-insensitive regex substring matching against the description field**:
 
 ```
-Diagnosis.description = "Systolic heart failure (disorder)"
-  → matches "heart failure" in chf_patterns
+Diagnosis.description = "Chronic congestive heart failure (disorder)"
+  → matches "congestive heart" in chf_patterns
   → cm_chf = 1
 ```
 
-Each encounter's diagnoses are concatenated into one string, then all 31 comorbidity regexes are tested against it. This approach works because SNOMED CT uses standardized, consistent clinical terminology.
+For each inpatient encounter, all diagnoses from the patient's **full history** (not just that encounter) are collected and matched — this is necessary because Synthea records diagnoses at first occurrence only, not repeated on every encounter.
 
-**Note:** This is less precise than ICD prefix matching. A SNOMED concept may not match if the description phrasing differs from the pattern list. For higher precision, use the official SNOMED CT → ICD-10 CM mapping file to convert SNOMED codes to ICD-10 first, then apply the standard Elixhauser ICD patterns.
+**Coverage audit:** The Synthea sample database contains exactly 45 unique SNOMED descriptions. All descriptions that correspond to Elixhauser categories are matched correctly. The descriptions that produce no match (e.g., Hyperlipidemia, Osteoporosis, Sepsis, Viral sinusitis, Atopic dermatitis) are genuinely outside the 31 Elixhauser categories — they are acute or non-Elixhauser conditions, so zero flags for those encounters is correct.
+
+| Synthea description | Matched category |
+|---|---|
+| Chronic congestive heart failure (disorder) | `cm_chf` |
+| Atrial fibrillation (disorder) | `cm_arrhythmia` |
+| Acute pulmonary embolism (disorder) | `cm_pulm_circ` |
+| Hypertension | `cm_htn_uncomp` |
+| Alzheimer's disease (disorder) | `cm_neuro_other` |
+| Asthma / Childhood asthma / Pulmonary emphysema | `cm_copd` |
+| Diabetes / Prediabetes | `cm_dm_uncomp` |
+| History of renal transplant (situation) | `cm_renal` |
+| Human immunodeficiency virus infection (disorder) | `cm_hiv` |
+| Acute myeloid leukemia disease (disorder) | `cm_lymphoma` |
+| Malignant neoplasm / Malignant tumor / Carcinoma / Neoplasm of | `cm_solid_tumor` |
+| Lupus erythematosus / Rheumatoid arthritis | `cm_rheumatoid` |
+| Anemia (disorder) | `cm_anemia` |
+| Opioid abuse (disorder) | `cm_drug` |
+| Major depression single episode | `cm_depression` |
+
+The `cm_lymphoma` pattern includes "leukemia" and "myeloma" in addition to "lymphoma" and "hodgkin", matching the original Elixhauser definition which covers all hematologic malignancies.
+
+**Why not SNOMED CT hierarchy matching?** A more precise approach would use the SNOMED IS-A concept hierarchy (e.g., find all descendants of concept 84114007 "Heart failure") rather than text patterns. This requires loading the full SNOMED CT RF2 release (~2 GB) into a local database. For this Synthea sample with 45 known descriptions, text matching achieves equivalent coverage and the added complexity is not justified.
 
 ---
 
@@ -168,7 +213,7 @@ Each encounter's diagnoses are concatenated into one string, then all 31 comorbi
 | Column | MIMIC-4 | MIMIC-3 | eICU | Synthea | Description |
 |---|---|---|---|---|---|
 | `los_days` | ✅ | ✅ | — | ✅ | Hospital length of stay in days |
-| `icu_los_days` | — | — | ✅ | — | ICU length of stay in days (filtered to 0–90) |
+| `icu_los_days` | — | — | ✅ | — | ICU length of stay in days (filtered 0–90, complete APACHE only) |
 
 ### Demographics
 
@@ -179,7 +224,7 @@ Each encounter's diagnoses are concatenated into one string, then all 31 comorbi
 | `insurance_cat` | ✅ | ✅ | — | — | 0=Medicare, 1=Medicaid, 2=Private, 3=Other |
 | `admission_location_cat` | ✅ | ✅ | — | — | Label-encoded admission location |
 | `ethnicity_cat` | — | — | ✅ | — | Label-encoded ethnicity |
-| `bmi` | — | — | ✅ | — | Body mass index at admission (clipped 10–80) |
+| `bmi` | — | — | ✅ | — | Body mass index at admission (median-imputed, clipped 10–80) |
 | `is_married` | — | — | — | ✅ | 1 if marital status = Married |
 | `income` | — | — | — | ✅ | Annual household income (USD) |
 
@@ -219,7 +264,7 @@ All coded as 0/1. See Comorbidity Logic section above for derivation details.
 | `cm_liver` | Liver Disease |
 | `cm_ulcer` | Peptic Ulcer |
 | `cm_hiv` | AIDS / HIV |
-| `cm_lymphoma` | Lymphoma |
+| `cm_lymphoma` | Lymphoma / Leukemia / Myeloma |
 | `cm_metastatic` | Metastatic Cancer |
 | `cm_solid_tumor` | Solid Tumor (without metastasis) |
 | `cm_rheumatoid` | Rheumatoid / Collagen Vascular Disease |
@@ -244,7 +289,7 @@ All coded as 0/1. See Comorbidity Logic section above for derivation details.
 | `num_prescriptions` | ✅ | ✅ | — | — | Number of medication orders |
 | `num_labs` | ✅ | ✅ | ✅ | — | Number of lab tests ordered |
 | `num_medications` | — | — | ✅ | — | Number of medication records (eICU) |
-| `num_drugs` | — | — | — | ✅ | Number of drug records (Synthea) |
+| `num_drugs` | — | — | — | ✅ | Active medications at time of admission (Synthea) |
 
 ### ICU & ED
 
@@ -256,7 +301,7 @@ All coded as 0/1. See Comorbidity Logic section above for derivation details.
 
 ### eICU-only: APACHE Variables
 
-Only available in `eicu_los.csv`. All prefixed with `apache_`.
+Only available in `eicu_los.csv`. All prefixed with `apache_`. Missing values (originally `-1` sentinel in eICU) are converted to `NaN`; rows with any missing value are dropped. Seven columns with >50% missingness (blood gas and liver function tests, only collected in intubated/critically ill subsets) are removed entirely.
 
 | Column | Type | Description |
 |---|---|---|
@@ -275,20 +320,13 @@ Only available in `eicu_los.csv`. All prefixed with `apache_`.
 | `apache_wbc` | continuous | White blood cell count (×10³/μL) |
 | `apache_hematocrit` | continuous | Hematocrit (%) |
 | `apache_sodium` | continuous | Serum sodium (mEq/L) |
-| `apache_ph` | continuous | Arterial pH |
-| `apache_pao2` | continuous | Arterial O₂ partial pressure (mmHg) |
-| `apache_pco2` | continuous | Arterial CO₂ partial pressure (mmHg) |
-| `apache_fio2` | continuous | Fraction of inspired oxygen (%) |
 | `apache_creatinine` | continuous | Serum creatinine (mg/dL) |
-| `apache_bilirubin` | continuous | Serum bilirubin (mg/dL) |
-| `apache_albumin` | continuous | Serum albumin (g/dL) |
 | `apache_glucose` | continuous | Blood glucose (mg/dL) |
 | `apache_bun` | continuous | Blood urea nitrogen (mg/dL) |
-| `apache_urine` | continuous | 24-hour urine output (mL) |
 
 ### ED Triage Vitals — MIMIC-4 only
 
-Recorded at ED triage. 0 for non-ED admissions. Not available in MIMIC-3 or Synthea.
+Recorded at ED triage. 0 for non-ED admissions. Not available in MIMIC-3 or Synthea Neo4j.
 
 | Column | Description |
 |---|---|
